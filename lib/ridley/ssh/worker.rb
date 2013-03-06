@@ -16,7 +16,8 @@ module Ridley
         @options = options.deep_symbolize_keys
         @sudo    = @options[:sudo]
         @user    = @options[:user]
-
+        @bastion_host = @options[:ssh][:bastion_host]
+        @bastion_user = @options[:ssh][:bastion_user]
         @options[:paranoid] = false
       end
 
@@ -28,38 +29,45 @@ module Ridley
         response = Response.new(host)
         debug "Running SSH command: '#{command}' on: '#{host}' as: '#{user}'"
 
-        Net::SSH.start(host, user, options.slice(*Net::SSH::VALID_OPTIONS)) do |ssh|
-          ssh.open_channel do |channel|
-            if self.sudo
-              channel.request_pty
+        ssh_block = lambda{|ssh|
+            ssh.open_channel do |channel|
+              if self.sudo
+                channel.request_pty
+              end
+
+              channel.exec(command) do |ch, success|
+                unless success
+                  raise "FAILURE: could not execute command"
+                end
+
+                channel.on_data do |ch, data|
+                  response.stdout += data
+                  info "NODE[#{host}] #{data}" if data.present? and data != "\r\n"
+                end
+
+                channel.on_extended_data do |ch, type, data|
+                  response.stderr += data
+                  info "NODE[#{host}] #{data}" if data.present? and data != "\r\n"
+                end
+
+                channel.on_request("exit-status") do |ch, data|
+                  response.exit_code = data.read_long
+                end
+
+                channel.on_request("exit-signal") do |ch, data|
+                  response.exit_signal = data.read_string
+                end
+              end
             end
-
-            channel.exec(command) do |ch, success|
-              unless success
-                raise "FAILURE: could not execute command"
-              end
-
-              channel.on_data do |ch, data|
-                response.stdout += data
-                info "NODE[#{host}] #{data}" if data.present? and data != "\r\n"
-              end
-
-              channel.on_extended_data do |ch, type, data|
-                response.stderr += data
-                info "NODE[#{host}] #{data}" if data.present? and data != "\r\n"
-              end
-
-              channel.on_request("exit-status") do |ch, data|
-                response.exit_code = data.read_long
-              end
-
-              channel.on_request("exit-signal") do |ch, data|
-                response.exit_signal = data.read_string
-              end
-            end
-          end
 
           ssh.loop
+        }
+
+        if @bastion_host
+          gateway = Net::SSH::Gateway.new(@bastion_host, @bastion_user, :port => 22)
+          gateway.ssh(host, user, options.slice(*Net::SSH::VALID_OPTIONS)) &ssh_block
+        else
+          Net::SSH.start(host, user, options.slice(*Net::SSH::VALID_OPTIONS)) &ssh_block
         end
 
         case response.exit_code
